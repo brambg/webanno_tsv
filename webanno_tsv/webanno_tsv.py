@@ -1,8 +1,10 @@
 import csv
 import itertools
 import re
-from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, replace, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+from icecream import ic
 
 NO_LABEL_ID = -1
 
@@ -34,12 +36,23 @@ class WebannoTsvDialect(csv.Dialect):
 
 
 @dataclass(frozen=True)
+class SubToken:
+    sentence_idx: int
+    idx: int
+    sub_idx: int
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class Token:
     sentence_idx: int
     idx: int
     start: int
     end: int
     text: str
+    sub_tokens: Sequence[SubToken] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -78,10 +91,10 @@ class Annotation:
 
     def should_merge(self, other: 'Annotation') -> bool:
         return self.has_label_id and other.has_label_id \
-               and self.label_id == other.label_id \
-               and self.label == other.label \
-               and self.field == other.field \
-               and self.layer == other.layer
+            and self.label_id == other.label_id \
+            and self.label == other.label \
+            and self.field == other.field \
+            and self.layer == other.layer
 
     def merge(self, *other: 'Annotation') -> 'Annotation':
         return replace(self, tokens=token_sort(list(self.tokens) + [t for o in other for t in o.tokens]))
@@ -260,7 +273,7 @@ def _read_span_layer_names(lines: List[str]):
     return [(m.group(1), m.group(2).split('|')) for m in matches if m]
 
 
-def _read_token(row: Dict) -> Token:
+def _read_token(row: Dict) -> Union[Token, SubToken]:
     """
     Construct a Token from the row object using the sentence from doc.
     This converts the first three columns of the TSV, e.g.:
@@ -272,10 +285,17 @@ def _read_token(row: Dict) -> Token:
     def intsplit(s: str):
         return [int(s) for s in s.split('-')]
 
-    sent_idx, tok_idx = intsplit(row['sent_tok_idx'])
+    sent_tok_idx = row['sent_tok_idx']
     start, end = intsplit(row['offsets'])
     text = _unescape(row['token'])
-    return Token(sentence_idx=sent_idx, idx=tok_idx, start=start, end=end, text=text)
+    if '.' in sent_tok_idx:
+        parts = sent_tok_idx.split('.')
+        sent_idx, tok_idx = intsplit(parts[0])
+        sub_idx = int(parts[1])
+        return SubToken(sentence_idx=sent_idx, idx=tok_idx, sub_idx=sub_idx, start=start, end=end, text=text)
+    else:
+        sent_idx, tok_idx = intsplit(sent_tok_idx)
+        return Token(sentence_idx=sent_idx, idx=tok_idx, start=start, end=end, text=text)
 
 
 def _read_annotation_field(row: Dict, layer: str, field: str) -> List[str]:
@@ -326,7 +346,8 @@ def _filter_sentences(lines: List[str]) -> List[str]:
 
 def _tsv_read_lines(lines: List[str], overriding_layer_names: List[Tuple[str, List[str]]] = None) -> Document:
     non_comments = [line for line in lines if not COMMENT_RE.match(line)]
-    token_data = [line for line in non_comments if not SUB_TOKEN_RE.match(line)]
+    token_data = [line for line in non_comments]
+    # token_data = [line for line in non_comments if not SUB_TOKEN_RE.match(line)]
     sentence_strs = _filter_sentences(lines)
     sentences = [Sentence(idx=i + 1, text=text) for i, text in enumerate(sentence_strs)]
 
@@ -341,12 +362,21 @@ def _tsv_read_lines(lines: List[str], overriding_layer_names: List[Tuple[str, Li
     annotations = []
     tokens = []
     for row in rows:
+        ic(row)
         # consume the first three columns of each line
         token = _read_token(row)
-        tokens.append(token)
+        if isinstance(token, SubToken):
+            # add this sub-token to the last token of the tokens list
+            parent_token = tokens[-1]
+            sub_tokens = parent_token.sub_tokens
+            sub_tokens.append(token)
+            tokens[-1] = replace(parent_token, sub_tokens=sub_tokens)
+        else:
+            tokens.append(token)
         # Each column after the first three is (part of) a span annotation layer
         for layer, fields in layer_defs:
             for annotation in _read_layer(token, row, layer, fields):
+                ic(annotation)
                 annotations = merge_into_annotations(annotations, annotation)
     return Document(layer_defs=layer_defs, sentences=sentences, tokens=tokens, annotations=annotations)
 
